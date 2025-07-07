@@ -254,7 +254,8 @@ class Program
                     amount = amount,
                     currency = row.GetValueOrDefault("currency", string.Empty),
                     source_id = sourceId,
-                    destination_id = destId
+                    destination_id = destId,
+                    category_name = row.GetValueOrDefault("category", string.Empty),
                 }
             }
         };
