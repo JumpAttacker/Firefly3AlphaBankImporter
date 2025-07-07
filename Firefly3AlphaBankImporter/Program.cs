@@ -115,13 +115,27 @@ class Program
             var row = header.Zip(fields, (h, v) => new {h, v})
                 .ToDictionary(x => x.h.Trim(), x => x.v.Trim());
 
-            if (!row.TryGetValue("transactionDate", out var date) || string.IsNullOrEmpty(date)
-                                                                  || !row.TryGetValue("status", out var status) || status != "Выполнен")
+            // 1) Всегда проверяем дату проводки
+            if (!row.TryGetValue("transactionDate", out var date)
+                || string.IsNullOrEmpty(date))
             {
                 skipped++;
                 continue;
             }
 
+            // 2) Только для не-пополнений проверяем статус
+            row.TryGetValue("type", out var typeValue);
+            if (!string.Equals(typeValue, "Пополнение", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!row.TryGetValue("status", out var status)
+                    || status != "Выполнен")
+                {
+                    skipped++;
+                    continue;
+                }
+            }
+
+            // 3) Вычисляем хэш, проверяем дубли и шлём транзакцию
             var txnId = ComputeUniqueId(row.Values);
             if (AlreadyProcessed(conn, txnId) || existingHashes.Contains(txnId))
             {
@@ -139,6 +153,7 @@ class Program
                 skipped++;
             }
         }
+
 
         Console.WriteLine($"Done. Processed: {processed}, Skipped: {skipped}");
     }
@@ -220,19 +235,22 @@ class Program
         if (!decimal.TryParse(amountStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var amount))
             return false;
 
-        var txnType = row.TryGetValue("type", out var t) && t == "Начисление" ? "deposit" : "withdrawal";
+        var txnType = row.TryGetValue("type", out var t) && t == "Пополнение" ? "deposit" : "withdrawal";
         var sourceId = txnType == "withdrawal" ? bankAccount : cashAccount;
         var destId = txnType == "deposit" ? bankAccount : cashAccount;
+        var description = row.GetValueOrDefault("merchant", string.Empty);
 
         var payload = new
         {
+            apply_rules = true,
+            fire_webhooks = true,
             transactions = new[]
             {
                 new
                 {
                     date = isoDate,
                     type = txnType,
-                    description = row.GetValueOrDefault("merchant", string.Empty),
+                    description = description,
                     amount = amount,
                     currency = row.GetValueOrDefault("currency", string.Empty),
                     source_id = sourceId,
@@ -252,7 +270,11 @@ class Program
         request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
 
         var resp = client.SendAsync(request).Result;
-        if (resp.IsSuccessStatusCode) return true;
+        if (resp.IsSuccessStatusCode)
+        {
+            Console.WriteLine($"Успешно добавили запись на {(txnType == "deposit" ? "+" : "-")}{amount} руб. ({description})");
+            return true;
+        }
         Console.Error.WriteLine($"Failed (Status {resp.StatusCode}): {resp.Content.ReadAsStringAsync().Result}");
         return false;
     }
