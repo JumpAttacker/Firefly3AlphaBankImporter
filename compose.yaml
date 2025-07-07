@@ -1,0 +1,7 @@
+﻿services:
+  firefly3alphabankimporter:
+    image: firefly3alphabankimporter
+    build:
+      context: .
+      dockerfile: Firefly3AlphaBankImporter/Dockerfile
+
