@@ -2,15 +2,9 @@
 // <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
 // <PackageReference Include="Microsoft.Data.Sqlite" Version="7.0.0" />
 
-using System;
-using System.Collections.Generic;
 using System.CommandLine;
-using System.CommandLine.Parsing;
 using Microsoft.Data.Sqlite;
 using System.Globalization;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -20,12 +14,6 @@ class Program
     static int Main(string[] args)
     {
         var rootCommand = new RootCommand("Import CSV transactions into Firefly III via API");
-
-        var csvOption = new Option<FileInfo>("--csv", "-c")
-        {
-            Description = "Path to CSV file",
-            Required = true
-        };
 
         var dbOption = new Option<FileInfo>("--db", "-d")
         {
@@ -56,38 +44,56 @@ class Program
             Description = "Firefly cash account ID",
             DefaultValueFactory = _ => Environment.GetEnvironmentVariable("FIREFLY_CASH_ACCOUNT_ID")
         };
+        var folderOption = new Option<DirectoryInfo>("--folder", "-f")
+        {
+            Description = "Папка с CSV-файлами (относительно текущей директории)",
+            DefaultValueFactory = _ =>
+                new DirectoryInfo(Path.Combine(Directory.GetCurrentDirectory(), "Input"))
+        };
 
-        rootCommand.Options.Add(csvOption);
         rootCommand.Options.Add(dbOption);
         rootCommand.Options.Add(urlOption);
         rootCommand.Options.Add(tokenOption);
         rootCommand.Options.Add(bankOption);
         rootCommand.Options.Add(cashOption);
-
+        rootCommand.Options.Add(folderOption);
         var parseResult = rootCommand.Parse(args);
 
-        var csvFile = parseResult.GetValue(csvOption);
         var dbFile = parseResult.GetValue(dbOption);
         var url = parseResult.GetValue(urlOption);
         var token = parseResult.GetValue(tokenOption);
         var bankAccount = parseResult.GetValue(bankOption);
         var cashAccount = parseResult.GetValue(cashOption);
+        var folder = parseResult.GetValue(folderOption);
 
         var existingHashes = FetchExistingHashes(
             new HttpClient {BaseAddress = new Uri(url), DefaultRequestHeaders = {{"Authorization", $"Bearer {token}"}}}
         );
 
-        Run(csvFile, dbFile, url, token, bankAccount, cashAccount, existingHashes);
+        Run(folder, dbFile, url, token, bankAccount, cashAccount, existingHashes);
 
         return 0;
     }
 
-    static void Run(FileInfo csv, FileInfo db, string url, string token, string bankAccount, string cashAccount, HashSet<string> existingHashes)
+    static void Run(
+        DirectoryInfo folder,
+        FileInfo db,
+        string url,
+        string token,
+        string bankAccount,
+        string cashAccount,
+        HashSet<string> existingHashes
+    )
     {
         if (string.IsNullOrEmpty(url) || string.IsNullOrEmpty(token)
                                       || string.IsNullOrEmpty(bankAccount) || string.IsNullOrEmpty(cashAccount))
         {
             Console.Error.WriteLine("Error: API URL, token, and both account IDs must be provided.");
+            Environment.Exit(1);
+        }
+        if (!folder.Exists)
+        {
+            Console.Error.WriteLine($"Папка не найдена: {folder.FullName}");
             Environment.Exit(1);
         }
 
@@ -98,59 +104,63 @@ class Program
         client.BaseAddress = new Uri(url);
         client.DefaultRequestHeaders.Add("Authorization", $"Bearer {token}");
 
-        using var reader = new StreamReader(csv.FullName, Encoding.UTF8);
-        var header = reader.ReadLine()?.Split(',');
-        if (header == null)
+        foreach (var file in folder.EnumerateFiles("*.csv"))
         {
-            Console.Error.WriteLine("CSV is empty or invalid");
-            return;
-        }
-
-        while (!reader.EndOfStream)
-        {
-            var line = reader.ReadLine();
-            if (string.IsNullOrWhiteSpace(line)) continue;
-
-            var fields = SplitCsvLine(line);
-            var row = header.Zip(fields, (h, v) => new {h, v})
-                .ToDictionary(x => x.h.Trim(), x => x.v.Trim());
-
-            // 1) Всегда проверяем дату проводки
-            if (!row.TryGetValue("transactionDate", out var date)
-                || string.IsNullOrEmpty(date))
+            Console.WriteLine($"Обрабатываем {file.Name}...");
+            using var reader = new StreamReader(file.FullName, Encoding.UTF8);
+            var header = reader.ReadLine()?.Split(',');
+            if (header == null)
             {
-                skipped++;
-                continue;
+                Console.Error.WriteLine("CSV is empty or invalid");
+                return;
             }
 
-            // 2) Только для не-пополнений проверяем статус
-            row.TryGetValue("type", out var typeValue);
-            if (!string.Equals(typeValue, "Пополнение", StringComparison.OrdinalIgnoreCase))
+            while (!reader.EndOfStream)
             {
-                if (!row.TryGetValue("status", out var status)
-                    || status != "Выполнен")
+                var line = reader.ReadLine();
+                if (string.IsNullOrWhiteSpace(line)) continue;
+
+                var fields = SplitCsvLine(line);
+                var row = header.Zip(fields, (h, v) => new {h, v})
+                    .ToDictionary(x => x.h.Trim(), x => x.v.Trim());
+
+                // 1) Всегда проверяем дату проводки
+                if (!row.TryGetValue("transactionDate", out var date)
+                    || string.IsNullOrEmpty(date))
                 {
                     skipped++;
                     continue;
                 }
-            }
 
-            // 3) Вычисляем хэш, проверяем дубли и шлём транзакцию
-            var txnId = ComputeUniqueId(row.Values);
-            if (AlreadyProcessed(conn, txnId) || existingHashes.Contains(txnId))
-            {
-                skipped++;
-                continue;
-            }
+                // 2) Только для не-пополнений проверяем статус
+                row.TryGetValue("type", out var typeValue);
+                if (!string.Equals(typeValue, "Пополнение", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!row.TryGetValue("status", out var status)
+                        || status != "Выполнен")
+                    {
+                        skipped++;
+                        continue;
+                    }
+                }
 
-            if (PostTransaction(client, bankAccount, cashAccount, row))
-            {
-                MarkProcessed(conn, txnId, row);
-                processed++;
-            }
-            else
-            {
-                skipped++;
+                // 3) Вычисляем хэш, проверяем дубли и шлём транзакцию
+                var txnId = ComputeUniqueId(row.Values);
+                if (AlreadyProcessed(conn, txnId) || existingHashes.Contains(txnId))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                if (PostTransaction(client, bankAccount, cashAccount, row))
+                {
+                    MarkProcessed(conn, txnId, row);
+                    processed++;
+                }
+                else
+                {
+                    skipped++;
+                }
             }
         }
 
@@ -276,6 +286,7 @@ class Program
             Console.WriteLine($"Успешно добавили запись на {(txnType == "deposit" ? "+" : "-")}{amount} руб. ({description})");
             return true;
         }
+
         Console.Error.WriteLine($"Failed (Status {resp.StatusCode}): {resp.Content.ReadAsStringAsync().Result}");
         return false;
     }
